@@ -25,11 +25,16 @@ tasks that need to be run.
 # Imports
 # -------------------------------------------------------------------------------------------------
 
-import datetime
+from datetime import datetime
 from itertools import chain
-from pathlib import Path
+import logging
 import os
+from pathlib import Path
 import sys
+import time
+
+from dask import delayed, compute, visualize
+from dask.distributed import Client, LocalCluster
 
 
 # -------------------------------------------------------------------------------------------------
@@ -99,7 +104,7 @@ class Task:
 
     def run(self):
         """To override."""
-        pass
+        print("run", self)
 
     @property
     def status(self):
@@ -174,11 +179,6 @@ class ExtractEphysTask(Task):
     io_charge = 50
     priority = 'high'
 
-    # def run(self):
-    #     p = self.session_dir / 'alf/_ibl_trials.a'
-    #     p.parent.mkdir(exist_ok=True, parents=True)
-    #     p.touch()
-
 
 class SpikeSortingTask(Task):
     name = 'spike_sorting'
@@ -227,38 +227,67 @@ class SpikeSortingMerge(Task):
     priority = 'high'
 
 
+TASK_CLASSES = {
+    'compress_avi': CompressVideoTask,
+    'compress_ephys': CompressEphysTask,
+    'compress_ephys_avi': CompressVideoEphysTask,
+    'dlc': DLCTask,
+    'extract_behaviour': ExtractBehaviorTask,
+    'extract_ephys': ExtractEphysTask,
+    'merge_spike_sorting': SpikeSortingMerge,
+    'qc_spike_sorting': SpikeSortingQCTask,
+    'raw_ephys_qc': RawEphysQCTask,
+    'register': RegisterTask,
+    'spike_sorting': SpikeSortingTask,
+}
+
+
 # -------------------------------------------------------------------------------------------------
 # Pipeline routines
 # -------------------------------------------------------------------------------------------------
 
-def all_task_classes():
-    """Return all task classes, i.e. all subclasses of the base Task class."""
-    return Task.__subclasses__()
-
-
 def missing_tasks(session_dir):
     """Create a list of tasks in a session directory, by scanning the directory and
     finding which tasks have not run yet and thus have not yet created the output files."""
-    for task_cls in all_task_classes():
+    for task_cls in TASK_CLASSES.values():
         task = task_cls(session_dir)
         if task.status != 'completed':
             yield task
 
 
-def create_dask_pipeline(task_requests):
-    """Create a Dask pipeline from a list of task requests."""
-    # TODO
-
-
-def run_dask_pipeline(pipeline):
-    """Run a Dask pipeline on the local computer, using multiple processes."""
-    # TODO
+def run_task(name, session_dir, dependencies=()):
+    task = TASK_CLASSES[name](session_dir)
+    task.started = datetime.now()
+    task.run()
+    task.status = 'completed'
+    task.completed = datetime.now()
 
 
 # -------------------------------------------------------------------------------------------------
 # Command-line interface
 # -------------------------------------------------------------------------------------------------
 
+def end(l):
+    return l
+
+
 if __name__ == '__main__':
-    session_dir = 'data'
-    print(list(missing_tasks(session_dir)))
+    d = {}
+    roots = ('.',)
+
+    session_dirs = list(find_session_dirs(roots))
+    for session_dir in session_dirs:
+        session_dir = str(session_dir)
+        for task in missing_tasks(session_dir):
+            d[('task_name', task.name)] = task.name
+            dependencies = [(dt, session_dir) for dt in task.depends_on]
+            d[(task.name, session_dir)] = (
+                run_task, ('task_name', task.name), session_dir, dependencies)
+        d[('end', session_dir)] = (
+            end, [(task_name, session_dir) for task_name in TASK_CLASSES.keys()])
+    visualize(d)
+
+    cluster = LocalCluster(processes=True, silence_logs=logging.WARN)
+    client = Client(cluster)
+    client.get(d, [('end', str(session_dir)) for session_dir in session_dirs])
+    client.close()
