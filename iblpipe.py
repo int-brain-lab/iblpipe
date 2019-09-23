@@ -28,6 +28,7 @@ tasks that need to be run.
 from datetime import datetime
 from itertools import chain
 import logging
+from operator import itemgetter
 import os
 from pathlib import Path
 import sys
@@ -35,6 +36,9 @@ import time
 
 from dask import delayed, compute, visualize
 from dask.distributed import Client, LocalCluster
+import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 # -------------------------------------------------------------------------------------------------
@@ -105,6 +109,10 @@ class Task:
     def run(self):
         """To override."""
         print("run", self)
+        time.sleep(10)
+        #
+        # for i in range(10):
+        # return np.exp(np.random.normal(int(1e2)))
 
     @property
     def status(self):
@@ -258,36 +266,52 @@ def missing_tasks(session_dir):
 def run_task(name, session_dir, dependencies=()):
     task = TASK_CLASSES[name](session_dir)
     task.started = datetime.now()
+    logger.info("Starting task %s on %s.", name, session_dir)
     task.run()
+    logger.info("Finished task %s on %s.", name, session_dir)
     task.status = 'completed'
     task.completed = datetime.now()
+    return 0
+
+
+def _count(l):
+    return (l)
+
+
+class Pipeline:
+    def __init__(self, root_dir, png_path=None):
+        self.session_dirs = list(find_session_dirs((root_dir,)))
+        d = {}
+        for session_dir in self.session_dirs:
+            session_dir = str(session_dir)
+            for task in missing_tasks(session_dir):
+                d[('task_name', task.name)] = task.name
+                dependencies = [(dt, session_dir) for dt in task.depends_on]
+                d[(task.name, session_dir)] = (
+                    run_task, ('task_name', task.name), session_dir, dependencies)
+            d[('end', session_dir)] = (
+                _count, [(task_name, session_dir) for task_name in TASK_CLASSES.keys()])
+        if png_path:
+            visualize(d, filename=png_path)
+        self.graph = d
+        self.create_cluster()
+
+    def create_cluster(self):
+        self.cluster = LocalCluster(
+            n_workers=1, processes=False, silence_logs=logging.DEBUG)
+        self.client = Client(self.cluster)
+
+    def run(self):
+        # TODO: check priority io etc
+        # TODO: continuous server of dashboard
+        return self.client.get(
+            self.graph, [('end', session_dir) for session_dir in self.session_dirs])
 
 
 # -------------------------------------------------------------------------------------------------
 # Command-line interface
 # -------------------------------------------------------------------------------------------------
 
-def end(l):
-    return l
-
-
 if __name__ == '__main__':
-    d = {}
-    roots = ('.',)
-
-    session_dirs = list(find_session_dirs(roots))
-    for session_dir in session_dirs:
-        session_dir = str(session_dir)
-        for task in missing_tasks(session_dir):
-            d[('task_name', task.name)] = task.name
-            dependencies = [(dt, session_dir) for dt in task.depends_on]
-            d[(task.name, session_dir)] = (
-                run_task, ('task_name', task.name), session_dir, dependencies)
-        d[('end', session_dir)] = (
-            end, [(task_name, session_dir) for task_name in TASK_CLASSES.keys()])
-    visualize(d)
-
-    cluster = LocalCluster(processes=True, silence_logs=logging.WARN)
-    client = Client(cluster)
-    client.get(d, [('end', str(session_dir)) for session_dir in session_dirs])
-    client.close()
+    p = Pipeline('.')
+    p.run()
